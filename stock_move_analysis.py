@@ -32,6 +32,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
+from numpy.lib.stride_tricks import sliding_window_view
 from scipy import stats
 
 try:
@@ -166,6 +167,7 @@ class MoveAnalysisResult:
     n_days: int
     pct_move: float
     direction: str
+    mode: str
     total_windows: int
     hit_count: int
     p_hat: float
@@ -197,19 +199,64 @@ def wilson_interval(count: int, total: int, confidence: float = 0.95):
     return max(0.0, lo), min(1.0, hi)
 
 
+def compute_window_paths(close: pd.Series, n_days: int) -> np.ndarray:
+    """
+    Builds every overlapping N-trading-day window and returns the full
+    day-by-day cumulative % return path within each window, as a 2D array
+    of shape (num_windows, n_days).
+
+    Row i is the window starting at trading day i; column o (0-indexed) is
+    the % return from the window's starting price to o+1 trading days
+    later. Column -1 (the last column) is therefore the "endpoint" return
+    -- equivalent to the old close.pct_change(periods=n_days) approach.
+    The full row is what 'touch' mode needs, since it has to know whether
+    the threshold was crossed on *any* day in the window, not just the last.
+    """
+    prices = close.to_numpy(dtype=float)
+    if len(prices) <= n_days:
+        return np.empty((0, n_days))
+    windows = sliding_window_view(prices, window_shape=n_days + 1)  # (num_windows, n_days+1)
+    base = windows[:, :1]
+    future = windows[:, 1:]
+    return (future / base - 1.0) * 100.0
+
+
 def compute_rolling_returns(close: pd.Series, n_days: int) -> pd.Series:
-    """Overlapping N-trading-day percentage returns across the whole history."""
+    """Overlapping N-trading-day ENDPOINT percentage returns (price N days
+    later vs. today) across the whole history. Kept for backwards
+    compatibility / use in the normal-model & chi-square sections, which
+    are about the endpoint return distribution regardless of which mode
+    is used to count hits."""
     returns = close.pct_change(periods=n_days) * 100.0
     return returns.dropna()
 
 
 def direction_hits(returns: pd.Series, pct_move: float, direction: str) -> int:
+    """Endpoint-mode hit count: was the price N days later past the target?"""
     if direction == "up":
         return int((returns >= pct_move).sum())
     elif direction == "down":
         return int((returns <= -pct_move).sum())
     else:  # either direction
-        return int((returns.abs() >= pct_move).sum())
+        return int((np.abs(returns) >= pct_move).sum())
+
+
+def direction_hits_touch(paths: np.ndarray, pct_move: float, direction: str) -> int:
+    """
+    Touch-mode hit count: was the target move reached on ANY day within
+    the window, even if the price settled back down by the window's end?
+    `paths` is the (num_windows, n_days) array from compute_window_paths.
+    """
+    if paths.size == 0:
+        return 0
+    max_ret = paths.max(axis=1)
+    min_ret = paths.min(axis=1)
+    if direction == "up":
+        return int((max_ret >= pct_move).sum())
+    elif direction == "down":
+        return int((min_ret <= -pct_move).sum())
+    else:  # either direction: touched +X% OR -X% at any point
+        return int(((max_ret >= pct_move) | (min_ret <= -pct_move)).sum())
 
 
 def chi_square_normality(returns: pd.Series, pct_move: float, direction: str):
@@ -263,21 +310,42 @@ def fetch_price_series(symbol: str, period: str = "10y") -> pd.Series:
 
 
 def analyze(symbol: str, pct_move: float, n_days: int, direction: str,
-            period: str = "10y", close: pd.Series = None) -> MoveAnalysisResult:
+            period: str = "10y", close: pd.Series = None,
+            mode: str = "endpoint") -> MoveAnalysisResult:
+    """
+    mode='endpoint' (default): a window counts as a "hit" only if the price
+        exactly n_days later is past the target -- ignores anything that
+        happened in between.
+    mode='touch': a window counts as a "hit" if the target was reached on
+        ANY day within the window, even if the price came back down (or up)
+        by the end. This directly answers "could this move have happened at
+        some point?" rather than "did it end up there?".
+    """
+    if mode not in ("endpoint", "touch"):
+        raise ValueError("mode must be 'endpoint' or 'touch'")
+
     if close is None:
         close = fetch_price_series(symbol, period)
 
-    returns = compute_rolling_returns(close, n_days)
-    total = len(returns)
+    # Endpoint returns are always computed -- they're what the normal-model
+    # and chi-square sections analyze, regardless of which mode is used to
+    # count hits.
+    endpoint_returns = compute_rolling_returns(close, n_days)
+    total = len(endpoint_returns)
     if total < 30:
         print(f"Warning: only {total} overlapping {n_days}-day windows available. "
               f"Results will be statistically weak.")
 
-    hits = direction_hits(returns, pct_move, direction)
+    if mode == "endpoint":
+        hits = direction_hits(endpoint_returns, pct_move, direction)
+    else:
+        paths = compute_window_paths(close, n_days)
+        hits = direction_hits_touch(paths, pct_move, direction)
+
     p_hat = hits / total if total else 0.0
     lo, hi = wilson_interval(hits, total)
 
-    chi2_stat, chi2_p, dof, mean, std = chi_square_normality(returns, pct_move, direction)
+    chi2_stat, chi2_p, dof, mean, std = chi_square_normality(endpoint_returns, pct_move, direction)
     normal_fits = chi2_p >= 0.05  # fail to reject normality at 5% level
 
     z = (pct_move - mean) / std if std > 0 else float("nan")
@@ -291,7 +359,7 @@ def analyze(symbol: str, pct_move: float, n_days: int, direction: str,
 
     return MoveAnalysisResult(
         symbol=symbol.upper(), n_days=n_days, pct_move=pct_move, direction=direction,
-        total_windows=total, hit_count=hits, p_hat=p_hat, wilson_lo=lo, wilson_hi=hi,
+        mode=mode, total_windows=total, hit_count=hits, p_hat=p_hat, wilson_lo=lo, wilson_hi=hi,
         hist_mean=mean, hist_std=std, z_score=z, normal_prob=normal_prob,
         chi2_stat=chi2_stat, chi2_pvalue=chi2_p, chi2_dof=dof, normal_fits=normal_fits,
     )
@@ -305,6 +373,7 @@ def analyze(symbol: str, pct_move: float, n_days: int, direction: str,
 class SimulationResult:
     symbol: str
     method: str
+    mode: str
     n_sims: int
     n_days: int
     pct_move: float
@@ -344,7 +413,7 @@ def estimate_mode(values: np.ndarray) -> float:
 
 def run_simulation(close: pd.Series, n_days: int, pct_move: float, direction: str,
                     n_sims: int = 10000, method: str = "bootstrap",
-                    seed: int = None) -> SimulationResult:
+                    seed: int = None, mode: str = "endpoint") -> SimulationResult:
     """
     Simulates n_sims independent N-trading-day price paths starting from
     TODAY's actual last close, and measures what fraction of those
@@ -357,7 +426,19 @@ def run_simulation(close: pd.Series, n_days: int, pct_move: float, direction: st
     method='normal': each simulated day's return is drawn from
         Normal(historical mean, historical std) — the classic textbook
         Monte Carlo / GBM approach. Included for side-by-side comparison.
+
+    mode='endpoint' (default): a simulated path counts as a "hit" only if
+        its price on day n_days is past the target.
+    mode='touch': a simulated path counts as a "hit" if the target was
+        crossed on ANY simulated day within the path, not just the last.
+        Note this only affects the hit-rate (p_sim); the forecast price
+        percentiles below are always the day-n_days (endpoint) distribution,
+        since "what will the price probably be" is inherently an endpoint
+        question.
     """
+    if mode not in ("endpoint", "touch"):
+        raise ValueError("mode must be 'endpoint' or 'touch'")
+
     daily_returns = close.pct_change().dropna().values  # decimal, e.g. 0.012 = 1.2%
     last_price = float(close.iloc[-1])
     rng = np.random.default_rng(seed)
@@ -370,16 +451,28 @@ def run_simulation(close: pd.Series, n_days: int, pct_move: float, direction: st
     else:
         raise ValueError("method must be 'bootstrap' or 'normal'")
 
-    cum_growth = np.cumprod(1 + sampled, axis=1)
+    cum_growth = np.cumprod(1 + sampled, axis=1)          # (n_sims, n_days)
+    path_pct_moves = (cum_growth - 1.0) * 100.0            # full within-path % move, every day
     final_prices = last_price * cum_growth[:, -1]
-    pct_moves = (final_prices / last_price - 1) * 100.0
+    pct_moves = path_pct_moves[:, -1]                      # endpoint % move (day n_days only)
 
-    if direction == "up":
-        hits = int((pct_moves >= pct_move).sum())
-    elif direction == "down":
-        hits = int((pct_moves <= -pct_move).sum())
-    else:
-        hits = int((np.abs(pct_moves) >= pct_move).sum())
+    if mode == "endpoint":
+        target = pct_moves
+        if direction == "up":
+            hits = int((target >= pct_move).sum())
+        elif direction == "down":
+            hits = int((target <= -pct_move).sum())
+        else:
+            hits = int((np.abs(target) >= pct_move).sum())
+    else:  # touch
+        max_path = path_pct_moves.max(axis=1)
+        min_path = path_pct_moves.min(axis=1)
+        if direction == "up":
+            hits = int((max_path >= pct_move).sum())
+        elif direction == "down":
+            hits = int((min_path <= -pct_move).sum())
+        else:
+            hits = int(((max_path >= pct_move) | (min_path <= -pct_move)).sum())
 
     p_sim = hits / n_sims
     lo, hi = wilson_interval(hits, n_sims)
@@ -390,7 +483,7 @@ def run_simulation(close: pd.Series, n_days: int, pct_move: float, direction: st
     mode_pct_move = (mode_price / last_price - 1) * 100.0
 
     return SimulationResult(
-        symbol="", method=method, n_sims=n_sims, n_days=n_days, pct_move=pct_move,
+        symbol="", method=method, mode=mode, n_sims=n_sims, n_days=n_days, pct_move=pct_move,
         direction=direction, last_price=last_price, hit_count=hits, p_sim=p_sim,
         wilson_lo=lo, wilson_hi=hi, price_percentiles=price_pcts,
         pct_move_percentiles=move_pcts, most_probable_price=mode_price,
@@ -402,8 +495,12 @@ def print_simulation_report(sim: SimulationResult):
     method_label = "Bootstrap (resampled from actual historical daily returns)" \
         if sim.method == "bootstrap" else "Parametric Normal (assumes normal daily returns)"
 
+    mode_note = "reached target on ANY simulated day (touch)" if sim.mode == "touch" \
+        else "price on day N only (endpoint)"
+
     print(f"\n[5] MONTE CARLO FORWARD SIMULATION — {sim.n_sims:,} simulated {sim.n_days}-day futures")
     print(f"    Method                                     : {method_label}")
+    print(f"    Hit counted as                             : {mode_note}")
     print(f"    Starting price (last close)                : {sim.last_price:.2f}")
     print(f"    Simulated probability of the target move   : {sim.p_sim*100:.2f}%")
     print(f"    95% Wilson CI on that simulated probability: {sim.wilson_lo*100:.2f}% - {sim.wilson_hi*100:.2f}%")
@@ -427,14 +524,20 @@ def print_report(res: MoveAnalysisResult, company_name: str = ""):
     dir_word = {"up": "gain of at least", "down": "drop of at least", "either": "move (up or down) of at least"}[res.direction]
     title = f"{res.symbol}" + (f" ({company_name})" if company_name else "")
 
+    mode_label = {
+        "endpoint": "ENDPOINT mode — only the price exactly N days later counts",
+        "touch": "TOUCH mode — counts if the target was reached on ANY day within the window",
+    }[res.mode]
+
     print("\n" + "=" * 70)
     print(f" MOVE PROBABILITY ANALYSIS — {title}")
     print("=" * 70)
     print(f"Question: over any {res.n_days}-trading-day window, what's the chance of a")
     print(f"          {dir_word} {res.pct_move:.2f}%?")
+    print(f"Mode:     {mode_label}")
     print("-" * 70)
 
-    print(f"\n[1] HISTORICAL FREQUENCY")
+    print(f"\n[1] HISTORICAL FREQUENCY ({res.mode} mode)")
     print(f"    Overlapping {res.n_days}-day windows examined : {res.total_windows}")
     print(f"    Windows meeting/exceeding the move        : {res.hit_count}")
     print(f"    Empirical probability                     : {res.p_hat*100:.2f}%")
@@ -442,13 +545,13 @@ def print_report(res: MoveAnalysisResult, company_name: str = ""):
     print(f"\n[2] 95% BINOMIAL (WILSON) CONFIDENCE INTERVAL")
     print(f"    True probability likely lies between      : {res.wilson_lo*100:.2f}% and {res.wilson_hi*100:.2f}%")
 
-    print(f"\n[3] NORMAL-DISTRIBUTION MODEL (for comparison)")
+    print(f"\n[3] NORMAL-DISTRIBUTION MODEL (for comparison, always based on endpoint returns)")
     print(f"    Historical mean {res.n_days}-day return        : {res.hist_mean:.2f}%")
     print(f"    Historical std-dev {res.n_days}-day return     : {res.hist_std:.2f}%")
     print(f"    Z-score of the target move                : {res.z_score:.2f}")
     print(f"    Normal-model implied probability          : {res.normal_prob*100:.2f}%")
 
-    print(f"\n[4] CHI-SQUARE GOODNESS-OF-FIT TEST (is 'Normal' a fair model here?)")
+    print(f"\n[4] CHI-SQUARE GOODNESS-OF-FIT TEST (is 'Normal' a fair model here? endpoint returns)")
     print(f"    Chi-square statistic                      : {res.chi2_stat:.3f}  (dof={res.chi2_dof})")
     print(f"    p-value                                   : {res.chi2_pvalue:.4f}")
     if res.normal_fits:
@@ -525,6 +628,14 @@ def interactive_main(ticker_csv: str = "tickers.csv"):
         print("Unrecognized direction, defaulting to 'either'.")
         direction = "either"
 
+    print("Mode — 'endpoint' only checks the price exactly N days later;")
+    print("       'touch' counts it if the move happened on ANY day within the window,")
+    print("       even if the price came back down (or up) by the end.")
+    mode = input("Mode — endpoint / touch [endpoint]: ").strip().lower() or "endpoint"
+    if mode not in ("endpoint", "touch"):
+        print("Unrecognized mode, defaulting to 'endpoint'.")
+        mode = "endpoint"
+
     sim_choice = input("Also run a Monte Carlo forward simulation? (y/n) [y]: ").strip().lower() or "y"
     do_sim = sim_choice.startswith("y")
     sim_method = "bootstrap"
@@ -541,11 +652,11 @@ def interactive_main(ticker_csv: str = "tickers.csv"):
 
     try:
         close = fetch_price_series(symbol)
-        result = analyze(symbol, pct_move, n_days, direction, close=close)
+        result = analyze(symbol, pct_move, n_days, direction, close=close, mode=mode)
         sim_result = None
         if do_sim:
             sim_result = run_simulation(close, n_days, pct_move, direction,
-                                         n_sims=n_sims, method=sim_method)
+                                         n_sims=n_sims, method=sim_method, mode=mode)
     except Exception as e:
         print(f"\nError: {e}")
         return
@@ -562,6 +673,10 @@ def cli_main():
     parser.add_argument("--pct", type=float, help="Target percentage move, e.g. 5")
     parser.add_argument("--days", type=int, help="Number of trading days, e.g. 10")
     parser.add_argument("--direction", choices=["up", "down", "either"], default="either")
+    parser.add_argument("--mode", choices=["endpoint", "touch"], default="endpoint",
+                         help="endpoint = only the price exactly N days later counts (default); "
+                              "touch = counts if the target was reached on ANY day within the "
+                              "window, even if the price settled back down by the end")
     parser.add_argument("--period", default="10y", help="History window to download, e.g. 5y, 10y, max")
     parser.add_argument("--tickers-csv", default="tickers.csv")
     parser.add_argument("--simulate", action="store_true",
@@ -576,11 +691,12 @@ def cli_main():
     if args.symbol and args.pct is not None and args.days is not None:
         ticker_map = load_ticker_map(args.tickers_csv)
         close = fetch_price_series(args.symbol, period=args.period)
-        result = analyze(args.symbol, args.pct, args.days, args.direction, close=close)
+        result = analyze(args.symbol, args.pct, args.days, args.direction, close=close, mode=args.mode)
         sim_result = None
         if args.simulate:
             sim_result = run_simulation(close, args.days, args.pct, args.direction,
-                                         n_sims=args.n_sims, method=args.sim_method, seed=args.seed)
+                                         n_sims=args.n_sims, method=args.sim_method, seed=args.seed,
+                                         mode=args.mode)
         print_report(result, ticker_map.get(args.symbol.upper(), ""))
         if sim_result is not None:
             print_simulation_report(sim_result)

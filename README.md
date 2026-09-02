@@ -25,6 +25,7 @@ You'll be prompted for:
 - Target % move (e.g. `5`)
 - Number of trading days (e.g. `10`)
 - Direction: `up`, `down`, or `either`
+- Mode: `endpoint` or `touch` (see "Endpoint vs. touch mode" below)
 
 ### Autofill from the ticker CSV
 
@@ -39,10 +40,42 @@ If `tickers.csv` is present, the symbol prompt supports:
 ## Run — command-line mode (for scripting)
 
 ```bash
-python stock_move_analysis.py --symbol RELIANCE --pct 5 --days 10 --direction either
+python stock_move_analysis.py --symbol RELIANCE --pct 5 --days 10 --direction either --mode touch
 ```
 
 Optional: `--period 5y` (default `10y`) controls how much history is pulled.
+Optional: `--mode endpoint` (default) or `--mode touch` — see below.
+
+## Endpoint vs. touch mode
+
+This controls what counts as a "hit" when scanning historical windows (and
+simulated futures):
+
+- **`endpoint` (default)** — a window only counts if the price *exactly*
+  N trading days later is past the target. A stock that spikes +8% on day
+  4 and settles back to +2% by day 10 counts as a **miss** for a 5%/10-day
+  target, since it doesn't compare anything in between.
+- **`touch`** — a window counts if the target was reached on **any** day
+  within the window, even if the price came back down (or up) by the end.
+  The same +8%-then-+2% example above counts as a **hit**.
+
+Which one you want depends on the question you're actually asking:
+- "Where will the price likely *be* in N days?" → `endpoint`
+- "Could the stock realistically *move* that much at some point within
+  N days?" (e.g. for setting a stop-loss, a target-sell alert, or an
+  options strike) → `touch`
+
+`touch` mode's hit rate is always **greater than or equal to** `endpoint`
+mode's for the same inputs, since every endpoint hit is also a touch (the
+last day is one of the days being checked) — the gap between the two tells
+you how much of the "possibility" is coming from intra-window swings that
+don't survive to the end of the window.
+
+The mode applies to both the historical-frequency count (steps 1-2) and
+the Monte Carlo simulation (step 5). The normal-distribution model and
+chi-square test (steps 3-4) always analyze the endpoint return
+distribution regardless of mode, since they're about the shape of the
+N-day return distribution itself, not about hit-counting.
 
 ## What it reports
 
@@ -95,7 +128,7 @@ Command-line mode:
 
 ```bash
 python stock_move_analysis.py --symbol RELIANCE --pct 5 --days 10 \
-    --simulate --sim-method bootstrap --n-sims 10000 --seed 42
+    --simulate --sim-method bootstrap --n-sims 10000 --seed 42 --mode touch
 ```
 
 `--seed` is optional — set it to get reproducible simulation results run to run.
