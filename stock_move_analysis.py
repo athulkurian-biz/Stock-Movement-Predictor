@@ -596,15 +596,20 @@ def print_verdict(res: MoveAnalysisResult, sim: SimulationResult = None):
 # Interactive CLI
 # --------------------------------------------------------------------------
 
-def interactive_main(ticker_csv: str = "tickers.csv"):
-    ticker_map = load_ticker_map(ticker_csv)
-    enable_autofill(ticker_map)
+class UserExit(Exception):
+    """Raised when the user asks to stop the interactive loop."""
+    pass
 
-    print("Stock Move Probability Analyzer (NSE)")
-    print("--------------------------------------")
-    if HAVE_READLINE and ticker_map:
-        print("(Tip: press Tab while typing the symbol or company name to autocomplete.)")
+
+def run_one_analysis(ticker_map: dict) -> None:
+    """Runs the full prompt -> fetch -> analyze -> report flow for a single
+    stock. Raises no exceptions to the caller for analysis errors (bad
+    symbol, no data, etc.) — those are caught and printed so a loop can
+    move on to the next stock instead of crashing out. Raises UserExit if
+    the user types 'exit'/'quit' at the symbol prompt."""
     raw = input("Enter stock symbol (e.g. RELIANCE, TCS, INFY): ")
+    if raw.strip().lower() in ("exit", "quit", "q"):
+        raise UserExit
     symbol = resolve_symbol(raw, ticker_map)
 
     while True:
@@ -665,6 +670,33 @@ def interactive_main(ticker_csv: str = "tickers.csv"):
     if sim_result is not None:
         print_simulation_report(sim_result)
     print_verdict(result, sim_result)
+
+
+def interactive_main(ticker_csv: str = "tickers.csv"):
+    ticker_map = load_ticker_map(ticker_csv)
+    enable_autofill(ticker_map)
+
+    print("Stock Move Probability Analyzer (NSE)")
+    print("--------------------------------------")
+    if HAVE_READLINE and ticker_map:
+        print("(Tip: press Tab while typing the symbol or company name to autocomplete.)")
+    print("(Tip: type 'exit' or 'quit' at the symbol prompt any time to stop.)\n")
+
+    while True:
+        try:
+            run_one_analysis(ticker_map)
+        except UserExit:
+            print("Exiting.")
+            return
+        except (EOFError, KeyboardInterrupt):
+            print("\nExiting.")
+            return
+
+        again = input("Analyze another stock? (y/n) [y]: ").strip().lower() or "y"
+        if again in ("n", "no", "exit", "quit", "q"):
+            print("Exiting.")
+            return
+        print()  # blank line to visually separate the next run
 
 
 def cli_main():
