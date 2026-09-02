@@ -60,8 +60,17 @@ Optional: `--period 5y` (default `10y`) controls how much history is pulled.
    real stock returns often have fatter tails than a normal curve predicts.
 5. **Monte Carlo forward simulation** (optional) — simulates thousands of
    possible N-day futures *starting from today's actual last price*, and
-   reports the fraction that hit your target move, plus a forecast price
-   range (5th/25th/50th/75th/95th percentiles). Two methods:
+   reports:
+   - the fraction of simulated futures that hit your target move
+   - a **most probable price** — the single highest-density outcome (the
+     peak of the simulated distribution, estimated via kernel density
+     estimation), which is *not* the same as the median. Compounded returns
+     produce a right-skewed price distribution (a stock can fall at most to
+     zero but can rise indefinitely), so the most likely single outcome
+     typically sits a little below the median/average forecast.
+   - a full forecast price range (5th/25th/50th/75th/95th percentiles)
+
+   Two simulation methods:
    - `bootstrap` (default, recommended) — each simulated day's return is
      resampled from the stock's own real historical daily returns, so any
      fat tails / skew flagged by the chi-square test carry through into

@@ -316,6 +316,30 @@ class SimulationResult:
     wilson_hi: float
     price_percentiles: dict     # {5: .., 25: .., 50: .., 75: .., 95: ..}
     pct_move_percentiles: dict  # same keys, in % terms
+    most_probable_price: float  # mode of the simulated final-price distribution
+    most_probable_pct_move: float
+
+
+def estimate_mode(values: np.ndarray) -> float:
+    """
+    Finds the most probable (highest-density) value in a distribution of
+    simulated outcomes, using a Gaussian kernel density estimate.
+
+    This is NOT the same as the median: compounded returns produce a
+    right-skewed price distribution (a stock can only fall to 0 but can
+    rise indefinitely), so the single most likely outcome typically sits
+    a bit below the median/mean.
+    """
+    try:
+        kde = stats.gaussian_kde(values)
+        grid = np.linspace(values.min(), values.max(), 2000)
+        density = kde(grid)
+        return float(grid[np.argmax(density)])
+    except Exception:
+        # fallback: histogram-based mode if KDE fails (e.g. near-zero variance)
+        counts, edges = np.histogram(values, bins=min(100, max(10, len(values) // 50)))
+        peak_bin = np.argmax(counts)
+        return float((edges[peak_bin] + edges[peak_bin + 1]) / 2)
 
 
 def run_simulation(close: pd.Series, n_days: int, pct_move: float, direction: str,
@@ -362,12 +386,15 @@ def run_simulation(close: pd.Series, n_days: int, pct_move: float, direction: st
 
     price_pcts = {q: float(np.percentile(final_prices, q)) for q in (5, 25, 50, 75, 95)}
     move_pcts = {q: float(np.percentile(pct_moves, q)) for q in (5, 25, 50, 75, 95)}
+    mode_price = estimate_mode(final_prices)
+    mode_pct_move = (mode_price / last_price - 1) * 100.0
 
     return SimulationResult(
         symbol="", method=method, n_sims=n_sims, n_days=n_days, pct_move=pct_move,
         direction=direction, last_price=last_price, hit_count=hits, p_sim=p_sim,
         wilson_lo=lo, wilson_hi=hi, price_percentiles=price_pcts,
-        pct_move_percentiles=move_pcts,
+        pct_move_percentiles=move_pcts, most_probable_price=mode_price,
+        most_probable_pct_move=mode_pct_move,
     )
 
 
@@ -380,11 +407,16 @@ def print_simulation_report(sim: SimulationResult):
     print(f"    Starting price (last close)                : {sim.last_price:.2f}")
     print(f"    Simulated probability of the target move   : {sim.p_sim*100:.2f}%")
     print(f"    95% Wilson CI on that simulated probability: {sim.wilson_lo*100:.2f}% - {sim.wilson_hi*100:.2f}%")
-    print(f"    Forecast price in {sim.n_days} trading days, by percentile:")
+    print(f"\n    >>> MOST PROBABLE PRICE in {sim.n_days} trading days : {sim.most_probable_price:.2f}"
+          f"  ({sim.most_probable_pct_move:+.2f}%)")
+    print(f"        (peak of the simulated outcome distribution — the single most")
+    print(f"         likely price, not the average or midpoint)")
+    print(f"\n    Forecast price in {sim.n_days} trading days, by percentile:")
     for q in (5, 25, 50, 75, 95):
         pct_change = sim.pct_move_percentiles[q]
-        print(f"        {q:>2}th percentile : {sim.price_percentiles[q]:>10.2f}  ({pct_change:+.2f}%)")
-    print(f"    (Median forecast = 50th percentile; 5th/95th give a rough 90% forecast range.)")
+        marker = "  <- median" if q == 50 else ""
+        print(f"        {q:>2}th percentile : {sim.price_percentiles[q]:>10.2f}  ({pct_change:+.2f}%){marker}")
+    print(f"    (5th/95th percentiles give a rough 90% forecast range.)")
 
 
 # --------------------------------------------------------------------------
@@ -447,6 +479,8 @@ def print_verdict(res: MoveAnalysisResult, sim: SimulationResult = None):
         print(f"\n    Looking FORWARD from today's price ({sim.n_sims:,} simulated {sim.n_days}-day")
         print(f"    futures, {sim.method} method): estimated probability ~{sim.p_sim*100:.1f}%")
         print(f"    (95% CI: {sim.wilson_lo*100:.1f}%-{sim.wilson_hi*100:.1f}%).")
+        print(f"    Most probable price in {sim.n_days} days: {sim.most_probable_price:.2f} "
+              f"({sim.most_probable_pct_move:+.2f}% from {sim.last_price:.2f}).")
         gap = abs(sim.p_sim - res.p_hat) * 100
         if gap > 5:
             print(f"    Note: this differs from the pure historical frequency by {gap:.1f} points --")
