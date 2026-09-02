@@ -250,16 +250,22 @@ def chi_square_normality(returns: pd.Series, pct_move: float, direction: str):
     return chi2_stat, p_value, dof, mean, std
 
 
-def analyze(symbol: str, pct_move: float, n_days: int, direction: str,
-            period: str = "10y") -> MoveAnalysisResult:
+def fetch_price_series(symbol: str, period: str = "10y") -> pd.Series:
+    """Downloads NSE daily close prices for a symbol via yfinance."""
     yf_symbol = symbol if symbol.upper().endswith(".NS") else f"{symbol.upper()}.NS"
     df = yf.download(yf_symbol, period=period, progress=False, auto_adjust=True)
     if df.empty:
         raise ValueError(f"No data returned for '{yf_symbol}'. Check the symbol.")
-
     close = df["Close"].dropna()
     if isinstance(close, pd.DataFrame):  # yfinance sometimes returns a 1-col DataFrame
         close = close.iloc[:, 0]
+    return close
+
+
+def analyze(symbol: str, pct_move: float, n_days: int, direction: str,
+            period: str = "10y", close: pd.Series = None) -> MoveAnalysisResult:
+    if close is None:
+        close = fetch_price_series(symbol, period)
 
     returns = compute_rolling_returns(close, n_days)
     total = len(returns)
@@ -289,6 +295,96 @@ def analyze(symbol: str, pct_move: float, n_days: int, direction: str,
         hist_mean=mean, hist_std=std, z_score=z, normal_prob=normal_prob,
         chi2_stat=chi2_stat, chi2_pvalue=chi2_p, chi2_dof=dof, normal_fits=normal_fits,
     )
+
+
+# --------------------------------------------------------------------------
+# Monte Carlo simulation — forward-looking forecast
+# --------------------------------------------------------------------------
+
+@dataclass
+class SimulationResult:
+    symbol: str
+    method: str
+    n_sims: int
+    n_days: int
+    pct_move: float
+    direction: str
+    last_price: float
+    hit_count: int
+    p_sim: float
+    wilson_lo: float
+    wilson_hi: float
+    price_percentiles: dict     # {5: .., 25: .., 50: .., 75: .., 95: ..}
+    pct_move_percentiles: dict  # same keys, in % terms
+
+
+def run_simulation(close: pd.Series, n_days: int, pct_move: float, direction: str,
+                    n_sims: int = 10000, method: str = "bootstrap",
+                    seed: int = None) -> SimulationResult:
+    """
+    Simulates n_sims independent N-trading-day price paths starting from
+    TODAY's actual last close, and measures what fraction of those
+    simulated futures hit the target move.
+
+    method='bootstrap' (recommended): each simulated day's return is drawn
+        (with replacement) from the stock's own actual historical daily
+        returns. This preserves whatever fat-tail / skew behaviour the
+        chi-square test found, unlike an assumed normal curve.
+    method='normal': each simulated day's return is drawn from
+        Normal(historical mean, historical std) — the classic textbook
+        Monte Carlo / GBM approach. Included for side-by-side comparison.
+    """
+    daily_returns = close.pct_change().dropna().values  # decimal, e.g. 0.012 = 1.2%
+    last_price = float(close.iloc[-1])
+    rng = np.random.default_rng(seed)
+
+    if method == "bootstrap":
+        sampled = rng.choice(daily_returns, size=(n_sims, n_days), replace=True)
+    elif method == "normal":
+        mu, sigma = daily_returns.mean(), daily_returns.std(ddof=1)
+        sampled = rng.normal(mu, sigma, size=(n_sims, n_days))
+    else:
+        raise ValueError("method must be 'bootstrap' or 'normal'")
+
+    cum_growth = np.cumprod(1 + sampled, axis=1)
+    final_prices = last_price * cum_growth[:, -1]
+    pct_moves = (final_prices / last_price - 1) * 100.0
+
+    if direction == "up":
+        hits = int((pct_moves >= pct_move).sum())
+    elif direction == "down":
+        hits = int((pct_moves <= -pct_move).sum())
+    else:
+        hits = int((np.abs(pct_moves) >= pct_move).sum())
+
+    p_sim = hits / n_sims
+    lo, hi = wilson_interval(hits, n_sims)
+
+    price_pcts = {q: float(np.percentile(final_prices, q)) for q in (5, 25, 50, 75, 95)}
+    move_pcts = {q: float(np.percentile(pct_moves, q)) for q in (5, 25, 50, 75, 95)}
+
+    return SimulationResult(
+        symbol="", method=method, n_sims=n_sims, n_days=n_days, pct_move=pct_move,
+        direction=direction, last_price=last_price, hit_count=hits, p_sim=p_sim,
+        wilson_lo=lo, wilson_hi=hi, price_percentiles=price_pcts,
+        pct_move_percentiles=move_pcts,
+    )
+
+
+def print_simulation_report(sim: SimulationResult):
+    method_label = "Bootstrap (resampled from actual historical daily returns)" \
+        if sim.method == "bootstrap" else "Parametric Normal (assumes normal daily returns)"
+
+    print(f"\n[5] MONTE CARLO FORWARD SIMULATION — {sim.n_sims:,} simulated {sim.n_days}-day futures")
+    print(f"    Method                                     : {method_label}")
+    print(f"    Starting price (last close)                : {sim.last_price:.2f}")
+    print(f"    Simulated probability of the target move   : {sim.p_sim*100:.2f}%")
+    print(f"    95% Wilson CI on that simulated probability: {sim.wilson_lo*100:.2f}% - {sim.wilson_hi*100:.2f}%")
+    print(f"    Forecast price in {sim.n_days} trading days, by percentile:")
+    for q in (5, 25, 50, 75, 95):
+        pct_change = sim.pct_move_percentiles[q]
+        print(f"        {q:>2}th percentile : {sim.price_percentiles[q]:>10.2f}  ({pct_change:+.2f}%)")
+    print(f"    (Median forecast = 50th percentile; 5th/95th give a rough 90% forecast range.)")
 
 
 # --------------------------------------------------------------------------
@@ -332,6 +428,8 @@ def print_report(res: MoveAnalysisResult, company_name: str = ""):
         print("       Trust the HISTORICAL FREQUENCY + Wilson interval over the")
         print("       normal-model number.")
 
+
+def print_verdict(res: MoveAnalysisResult, sim: SimulationResult = None):
     print("\n" + "-" * 70)
     print("VERDICT")
     if res.hit_count == 0:
@@ -344,6 +442,16 @@ def print_report(res: MoveAnalysisResult, company_name: str = ""):
         print(f"    Historically this has happened ~{res.p_hat*100:.1f}% of the time")
         print(f"    (95% CI: {res.wilson_lo*100:.1f}%-{res.wilson_hi*100:.1f}%), so it IS possible")
         print(f"    and has real historical precedent for {res.symbol}.")
+
+    if sim is not None:
+        print(f"\n    Looking FORWARD from today's price ({sim.n_sims:,} simulated {sim.n_days}-day")
+        print(f"    futures, {sim.method} method): estimated probability ~{sim.p_sim*100:.1f}%")
+        print(f"    (95% CI: {sim.wilson_lo*100:.1f}%-{sim.wilson_hi*100:.1f}%).")
+        gap = abs(sim.p_sim - res.p_hat) * 100
+        if gap > 5:
+            print(f"    Note: this differs from the pure historical frequency by {gap:.1f} points --")
+            print(f"    that's expected since the simulation starts from TODAY's price/volatility")
+            print(f"    regime rather than averaging over the stock's whole history.")
     print("=" * 70 + "\n")
 
 
@@ -383,13 +491,35 @@ def interactive_main(ticker_csv: str = "tickers.csv"):
         print("Unrecognized direction, defaulting to 'either'.")
         direction = "either"
 
+    sim_choice = input("Also run a Monte Carlo forward simulation? (y/n) [y]: ").strip().lower() or "y"
+    do_sim = sim_choice.startswith("y")
+    sim_method = "bootstrap"
+    n_sims = 10000
+    if do_sim:
+        method_choice = input(
+            "Simulation method — bootstrap (historical resampling) / normal [bootstrap]: "
+        ).strip().lower() or "bootstrap"
+        if method_choice in ("bootstrap", "normal"):
+            sim_method = method_choice
+        raw_n = input("Number of simulations [10000]: ").strip()
+        if raw_n.isdigit():
+            n_sims = int(raw_n)
+
     try:
-        result = analyze(symbol, pct_move, n_days, direction)
+        close = fetch_price_series(symbol)
+        result = analyze(symbol, pct_move, n_days, direction, close=close)
+        sim_result = None
+        if do_sim:
+            sim_result = run_simulation(close, n_days, pct_move, direction,
+                                         n_sims=n_sims, method=sim_method)
     except Exception as e:
         print(f"\nError: {e}")
         return
 
     print_report(result, ticker_map.get(symbol, ""))
+    if sim_result is not None:
+        print_simulation_report(sim_result)
+    print_verdict(result, sim_result)
 
 
 def cli_main():
@@ -400,12 +530,27 @@ def cli_main():
     parser.add_argument("--direction", choices=["up", "down", "either"], default="either")
     parser.add_argument("--period", default="10y", help="History window to download, e.g. 5y, 10y, max")
     parser.add_argument("--tickers-csv", default="tickers.csv")
+    parser.add_argument("--simulate", action="store_true",
+                         help="Also run a Monte Carlo forward simulation from today's price")
+    parser.add_argument("--sim-method", choices=["bootstrap", "normal"], default="bootstrap",
+                         help="bootstrap = resample real historical daily returns (default); "
+                              "normal = assume normally distributed daily returns")
+    parser.add_argument("--n-sims", type=int, default=10000, help="Number of simulated paths")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducible simulations")
     args = parser.parse_args()
 
     if args.symbol and args.pct is not None and args.days is not None:
         ticker_map = load_ticker_map(args.tickers_csv)
-        result = analyze(args.symbol, args.pct, args.days, args.direction, period=args.period)
+        close = fetch_price_series(args.symbol, period=args.period)
+        result = analyze(args.symbol, args.pct, args.days, args.direction, close=close)
+        sim_result = None
+        if args.simulate:
+            sim_result = run_simulation(close, args.days, args.pct, args.direction,
+                                         n_sims=args.n_sims, method=args.sim_method, seed=args.seed)
         print_report(result, ticker_map.get(args.symbol.upper(), ""))
+        if sim_result is not None:
+            print_simulation_report(sim_result)
+        print_verdict(result, sim_result)
     else:
         interactive_main(args.tickers_csv)
 

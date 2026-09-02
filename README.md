@@ -26,6 +26,16 @@ You'll be prompted for:
 - Number of trading days (e.g. `10`)
 - Direction: `up`, `down`, or `either`
 
+### Autofill from the ticker CSV
+
+If `tickers.csv` is present, the symbol prompt supports:
+- **Tab-completion** — start typing a symbol or company name and press `Tab`
+  to autocomplete or cycle through matches (uses Python's built-in
+  `readline`; on Windows run `pip install pyreadline3` first).
+- **Typo suggestions** — if what you type doesn't match the list exactly,
+  it shows the closest symbol/company-name matches and lets you pick one
+  by number.
+
 ## Run — command-line mode (for scripting)
 
 ```bash
@@ -48,6 +58,38 @@ Optional: `--period 5y` (default `10y`) controls how much history is pulled.
    question. If it doesn't (p < 0.05), the historical frequency (steps 1-2)
    should be trusted more than the normal-model number (step 3), since
    real stock returns often have fatter tails than a normal curve predicts.
+5. **Monte Carlo forward simulation** (optional) — simulates thousands of
+   possible N-day futures *starting from today's actual last price*, and
+   reports the fraction that hit your target move, plus a forecast price
+   range (5th/25th/50th/75th/95th percentiles). Two methods:
+   - `bootstrap` (default, recommended) — each simulated day's return is
+     resampled from the stock's own real historical daily returns, so any
+     fat tails / skew flagged by the chi-square test carry through into
+     the forecast.
+   - `normal` — the classic textbook approach: each simulated day's return
+     is drawn from Normal(historical mean, historical std). Useful as a
+     side-by-side comparison, but understates tail risk if the chi-square
+     test rejected normality.
+
+   The historical-frequency number (steps 1-2) and the simulation number
+   (step 5) can differ — that's expected. The historical number averages
+   over the stock's *entire* history; the simulation starts from *today's*
+   price and (via bootstrap) today's recent volatility character, so it's
+   the more genuinely forward-looking estimate of the two.
+
+### Running the simulation
+
+Interactive mode will ask if you want to run it, which method, and how
+many simulated paths (default 10,000).
+
+Command-line mode:
+
+```bash
+python stock_move_analysis.py --symbol RELIANCE --pct 5 --days 10 \
+    --simulate --sim-method bootstrap --n-sims 10000 --seed 42
+```
+
+`--seed` is optional — set it to get reproducible simulation results run to run.
 
 ## Notes / limitations
 
