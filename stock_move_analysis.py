@@ -297,9 +297,31 @@ def chi_square_normality(returns: pd.Series, pct_move: float, direction: str):
     return chi2_stat, p_value, dof, mean, std
 
 
+# Index/ticker symbols that yfinance already recognizes as-is (or via a "^"
+# prefix rather than an NSE-equity ".NS" suffix) -- appending ".NS" to these
+# would break them. Add more here if you hit the same issue with another
+# index symbol.
+NON_NS_SYMBOLS = {
+    "NSEI",       # Nifty 50
+    "NSEBANK",    # Bank Nifty
+    "NSMIDCP",    # Nifty Midcap Select
+    "CNX100",     # Nifty 100
+    "CNXIT",      # Nifty IT
+    "INDIAVIX",   # India VIX
+}
+
+
 def fetch_price_series(symbol: str, period: str = "10y") -> pd.Series:
-    """Downloads NSE daily close prices for a symbol via yfinance."""
-    yf_symbol = symbol if symbol.upper().endswith(".NS") else f"{symbol.upper()}.NS"
+    """Downloads daily close prices for a symbol via yfinance.
+    Plain equity symbols get NSE's '.NS' suffix appended (e.g. RELIANCE ->
+    RELIANCE.NS). Symbols that are already index/full tickers -- starting
+    with '^', already ending in '.NS', or in NON_NS_SYMBOLS (e.g. NSEI,
+    which yfinance expects bare, not NSEI.NS) -- are passed through as-is."""
+    sym_u = symbol.strip().upper()
+    if sym_u.startswith("^") or sym_u.endswith(".NS") or sym_u in NON_NS_SYMBOLS:
+        yf_symbol = sym_u
+    else:
+        yf_symbol = f"{sym_u}.NS"
     df = yf.download(yf_symbol, period=period, progress=False, auto_adjust=True)
     if df.empty:
         raise ValueError(f"No data returned for '{yf_symbol}'. Check the symbol.")
@@ -311,7 +333,7 @@ def fetch_price_series(symbol: str, period: str = "10y") -> pd.Series:
 
 def analyze(symbol: str, pct_move: float, n_days: int, direction: str,
             period: str = "10y", close: pd.Series = None,
-            mode: str = "endpoint") -> MoveAnalysisResult:
+            mode: str = "touch") -> MoveAnalysisResult:
     """
     mode='endpoint' (default): a window counts as a "hit" only if the price
         exactly n_days later is past the target -- ignores anything that
@@ -413,7 +435,7 @@ def estimate_mode(values: np.ndarray) -> float:
 
 def run_simulation(close: pd.Series, n_days: int, pct_move: float, direction: str,
                     n_sims: int = 10000, method: str = "bootstrap",
-                    seed: int = None, mode: str = "endpoint") -> SimulationResult:
+                    seed: int = None, mode: str = "touch") -> SimulationResult:
     """
     Simulates n_sims independent N-trading-day price paths starting from
     TODAY's actual last close, and measures what fraction of those
@@ -601,6 +623,26 @@ class UserExit(Exception):
     pass
 
 
+def ask_choice(prompt: str, options: dict, default: str) -> str:
+    """
+    Prompts for a single-letter choice, e.g. options={"u": "up", "d": "down",
+    "e": "either"}. Accepts the letter (preferred) or the full word, either
+    case-insensitively; blank input takes the default. Returns the full word
+    (e.g. "up"), never the letter, so callers don't need to translate.
+    """
+    display = "/".join(f"[{letter}]{word[1:]}" for letter, word in options.items())
+    words_to_letters = {word: letter for letter, word in options.items()}
+    while True:
+        raw = input(f"{prompt} — {display} [{default}]: ").strip().lower()
+        if not raw:
+            raw = default
+        if raw in options:
+            return options[raw]
+        if raw in words_to_letters:
+            return raw
+        print(f"Please enter one of: {', '.join(options.keys())}")
+
+
 def run_one_analysis(ticker_map: dict) -> None:
     """Runs the full prompt -> fetch -> analyze -> report flow for a single
     stock. Raises no exceptions to the caller for analysis errors (bad
@@ -628,29 +670,20 @@ def run_one_analysis(ticker_map: dict) -> None:
         except ValueError:
             print("Please enter a positive whole number of days.")
 
-    direction = input("Direction — up / down / either [either]: ").strip().lower() or "either"
-    if direction not in ("up", "down", "either"):
-        print("Unrecognized direction, defaulting to 'either'.")
-        direction = "either"
+    direction = ask_choice("Direction", {"u": "up", "d": "down", "e": "either"}, "e")
 
-    print("Mode — 'endpoint' only checks the price exactly N days later;")
-    print("       'touch' counts it if the move happened on ANY day within the window,")
-    print("       even if the price came back down (or up) by the end.")
-    mode = input("Mode — endpoint / touch [endpoint]: ").strip().lower() or "endpoint"
-    if mode not in ("endpoint", "touch"):
-        print("Unrecognized mode, defaulting to 'endpoint'.")
-        mode = "endpoint"
+    print("Mode — 't' only counts it if the move happened on ANY day within the window,")
+    print("       even if the price came back down (or up) by the end (recommended);")
+    print("       'e' only checks the price exactly N days later.")
+    mode = ask_choice("Mode", {"t": "touch", "e": "endpoint"}, "t")
 
-    sim_choice = input("Also run a Monte Carlo forward simulation? (y/n) [y]: ").strip().lower() or "y"
-    do_sim = sim_choice.startswith("y")
+    do_sim = ask_choice("Also run a Monte Carlo forward simulation?", {"y": "yes", "n": "no"}, "y") == "yes"
     sim_method = "bootstrap"
     n_sims = 10000
     if do_sim:
-        method_choice = input(
-            "Simulation method — bootstrap (historical resampling) / normal [bootstrap]: "
-        ).strip().lower() or "bootstrap"
-        if method_choice in ("bootstrap", "normal"):
-            sim_method = method_choice
+        sim_method = ask_choice(
+            "Simulation method", {"b": "bootstrap", "n": "normal"}, "b"
+        )
         raw_n = input("Number of simulations [10000]: ").strip()
         if raw_n.isdigit():
             n_sims = int(raw_n)
@@ -692,8 +725,8 @@ def interactive_main(ticker_csv: str = "tickers.csv"):
             print("\nExiting.")
             return
 
-        again = input("Analyze another stock? (y/n) [y]: ").strip().lower() or "y"
-        if again in ("n", "no", "exit", "quit", "q"):
+        again = ask_choice("Analyze another stock?", {"y": "yes", "n": "no"}, "y")
+        if again == "no":
             print("Exiting.")
             return
         print()  # blank line to visually separate the next run
@@ -705,10 +738,10 @@ def cli_main():
     parser.add_argument("--pct", type=float, help="Target percentage move, e.g. 5")
     parser.add_argument("--days", type=int, help="Number of trading days, e.g. 10")
     parser.add_argument("--direction", choices=["up", "down", "either"], default="either")
-    parser.add_argument("--mode", choices=["endpoint", "touch"], default="endpoint",
-                         help="endpoint = only the price exactly N days later counts (default); "
-                              "touch = counts if the target was reached on ANY day within the "
-                              "window, even if the price settled back down by the end")
+    parser.add_argument("--mode", choices=["endpoint", "touch"], default="touch",
+                         help="touch (default) = counts if the target was reached on ANY day "
+                              "within the window, even if the price settled back down by the "
+                              "end; endpoint = only the price exactly N days later counts")
     parser.add_argument("--period", default="10y", help="History window to download, e.g. 5y, 10y, max")
     parser.add_argument("--tickers-csv", default="tickers.csv")
     parser.add_argument("--simulate", action="store_true",
