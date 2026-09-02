@@ -27,6 +27,7 @@ import sys
 import math
 import csv
 import argparse
+import difflib
 from dataclasses import dataclass
 
 import numpy as np
@@ -38,6 +39,15 @@ try:
 except ImportError:
     print("This script needs yfinance. Install it with:\n    pip install yfinance")
     sys.exit(1)
+
+# readline gives tab-completion in the interactive prompt. It's built into
+# Python on macOS/Linux. On Windows it's not available by default -- install
+# `pyreadline3` (pip install pyreadline3) to get the same behaviour there.
+try:
+    import readline
+    HAVE_READLINE = True
+except ImportError:
+    HAVE_READLINE = False
 
 
 # --------------------------------------------------------------------------
@@ -60,6 +70,90 @@ def load_ticker_map(csv_path: str) -> dict:
     except FileNotFoundError:
         print(f"(Note: ticker list '{csv_path}' not found — skipping name lookup.)")
     return mapping
+
+
+class SymbolCompleter:
+    """Tab-completion source for readline: matches on ticker symbol prefix,
+    and also lets you tab-complete by typing the start of the company name."""
+
+    def __init__(self, ticker_map: dict):
+        self.symbols = sorted(ticker_map.keys())
+        # allow completing by company name too, mapped back to its symbol
+        self.name_to_symbol = {
+            name.upper(): sym for sym, name in ticker_map.items() if name
+        }
+        self._matches = []
+
+    def complete(self, text, state):
+        text_u = text.upper()
+        if state == 0:
+            by_symbol = [s for s in self.symbols if s.startswith(text_u)]
+            by_name = [
+                f"{sym} ({name})"
+                for name, sym in self.name_to_symbol.items()
+                if name.startswith(text_u)
+            ]
+            self._matches = by_symbol + by_name
+        try:
+            return self._matches[state]
+        except IndexError:
+            return None
+
+
+def enable_autofill(ticker_map: dict):
+    """Wire up readline so pressing Tab while typing a symbol autocompletes
+    it from the loaded ticker CSV. No-op if readline isn't available
+    (e.g. Windows without pyreadline3) or the ticker map is empty."""
+    if not HAVE_READLINE or not ticker_map:
+        return
+    completer = SymbolCompleter(ticker_map)
+    readline.set_completer(completer.complete)
+    # treat these as word boundaries so it completes the whole symbol/name
+    readline.set_completer_delims(" \t\n")
+    readline.parse_and_bind("tab: complete")
+
+
+def resolve_symbol(raw_input: str, ticker_map: dict) -> str:
+    """Cleans up user input and, if it doesn't match the ticker list exactly,
+    suggests close matches (fuzzy match on symbol and on company name)."""
+    symbol = raw_input.strip().upper()
+
+    # allow "SYMBOL (Company Name)" pasted straight from a tab-completion
+    if "(" in symbol:
+        symbol = symbol.split("(")[0].strip()
+
+    if not ticker_map or symbol in ticker_map:
+        return symbol
+
+    # try matching against company names typed in full or partially
+    name_matches = difflib.get_close_matches(
+        symbol, [n.upper() for n in ticker_map.values() if n], n=3, cutoff=0.6
+    )
+    symbol_matches = difflib.get_close_matches(symbol, ticker_map.keys(), n=3, cutoff=0.6)
+
+    if symbol_matches or name_matches:
+        print(f"'{symbol}' not found in the ticker list exactly. Did you mean:")
+        seen = set()
+        options = []
+        for s in symbol_matches:
+            if s not in seen:
+                seen.add(s)
+                options.append(s)
+        for n in name_matches:
+            for sym, name in ticker_map.items():
+                if name.upper() == n and sym not in seen:
+                    seen.add(sym)
+                    options.append(sym)
+        for i, opt in enumerate(options, 1):
+            print(f"    {i}. {opt} — {ticker_map.get(opt, '')}")
+        choice = input(f"Pick a number to use it, or press Enter to keep '{symbol}': ").strip()
+        if choice.isdigit() and 1 <= int(choice) <= len(options):
+            return options[int(choice) - 1]
+    else:
+        print(f"'{symbol}' not found in the local NSE ticker list — proceeding anyway "
+              f"(it may still be a valid Yahoo Finance symbol).")
+
+    return symbol
 
 
 # --------------------------------------------------------------------------
@@ -259,13 +353,14 @@ def print_report(res: MoveAnalysisResult, company_name: str = ""):
 
 def interactive_main(ticker_csv: str = "tickers.csv"):
     ticker_map = load_ticker_map(ticker_csv)
+    enable_autofill(ticker_map)
 
     print("Stock Move Probability Analyzer (NSE)")
     print("--------------------------------------")
-    symbol = input("Enter stock symbol (e.g. RELIANCE, TCS, INFY): ").strip().upper()
-    if ticker_map and symbol not in ticker_map:
-        print(f"'{symbol}' not found in the local NSE ticker list — proceeding anyway "
-              f"(it may still be a valid Yahoo Finance symbol).")
+    if HAVE_READLINE and ticker_map:
+        print("(Tip: press Tab while typing the symbol or company name to autocomplete.)")
+    raw = input("Enter stock symbol (e.g. RELIANCE, TCS, INFY): ")
+    symbol = resolve_symbol(raw, ticker_map)
 
     while True:
         try:
