@@ -181,6 +181,11 @@ class MoveAnalysisResult:
     chi2_pvalue: float
     chi2_dof: int
     normal_fits: bool
+    last_price: float
+    high_pct_percentiles: dict    # percentiles of the BEST intra-window % swing, historically
+    low_pct_percentiles: dict     # percentiles of the WORST intra-window % swing, historically
+    high_price_percentiles: dict  # same, converted to a price using today's last close
+    low_price_percentiles: dict
 
 
 def wilson_interval(count: int, total: int, confidence: float = 0.95):
@@ -197,6 +202,19 @@ def wilson_interval(count: int, total: int, confidence: float = 0.95):
     lo = (centre - adj) / denom
     hi = (centre + adj) / denom
     return max(0.0, lo), min(1.0, hi)
+
+
+PERCENTILE_QS = (5, 25, 50, 75, 95)
+
+
+def percentile_dict(values: np.ndarray, qs=PERCENTILE_QS) -> dict:
+    """{q: percentile value} for each q in qs. Returns NaN for every q if
+    `values` is empty, so downstream formatting doesn't have to special-case
+    an empty array."""
+    values = np.asarray(values)
+    if values.size == 0:
+        return {q: float("nan") for q in qs}
+    return {q: float(np.percentile(values, q)) for q in qs}
 
 
 def compute_window_paths(close: pd.Series, n_days: int) -> np.ndarray:
@@ -349,6 +367,8 @@ def analyze(symbol: str, pct_move: float, n_days: int, direction: str,
     if close is None:
         close = fetch_price_series(symbol, period)
 
+    last_price = float(close.iloc[-1])
+
     # Endpoint returns are always computed -- they're what the normal-model
     # and chi-square sections analyze, regardless of which mode is used to
     # count hits.
@@ -358,10 +378,14 @@ def analyze(symbol: str, pct_move: float, n_days: int, direction: str,
         print(f"Warning: only {total} overlapping {n_days}-day windows available. "
               f"Results will be statistically weak.")
 
+    # Full within-window paths are always computed too, both for touch-mode
+    # hit counting AND for the "possible high/low" price levels below --
+    # those are useful regardless of which mode is selected.
+    paths = compute_window_paths(close, n_days)
+
     if mode == "endpoint":
         hits = direction_hits(endpoint_returns, pct_move, direction)
     else:
-        paths = compute_window_paths(close, n_days)
         hits = direction_hits_touch(paths, pct_move, direction)
 
     p_hat = hits / total if total else 0.0
@@ -379,11 +403,26 @@ def analyze(symbol: str, pct_move: float, n_days: int, direction: str,
         normal_prob = (1 - stats.norm.cdf(pct_move, loc=mean, scale=std)) + \
                        stats.norm.cdf(-pct_move, loc=mean, scale=std)
 
+    # "Possible high/low" -- across every historical N-day window, what was
+    # the best (highest) and worst (lowest) point reached at any time within
+    # the window? Percentiles of those per-window extremes, applied to
+    # TODAY's actual price, give a historically-grounded price range for
+    # what the stock could plausibly swing to over the next n_days.
+    window_high_pct = paths.max(axis=1) if paths.size else np.array([])
+    window_low_pct = paths.min(axis=1) if paths.size else np.array([])
+    high_pct_percentiles = percentile_dict(window_high_pct)
+    low_pct_percentiles = percentile_dict(window_low_pct)
+    high_price_percentiles = {q: last_price * (1 + v / 100.0) for q, v in high_pct_percentiles.items()}
+    low_price_percentiles = {q: last_price * (1 + v / 100.0) for q, v in low_pct_percentiles.items()}
+
     return MoveAnalysisResult(
         symbol=symbol.upper(), n_days=n_days, pct_move=pct_move, direction=direction,
         mode=mode, total_windows=total, hit_count=hits, p_hat=p_hat, wilson_lo=lo, wilson_hi=hi,
         hist_mean=mean, hist_std=std, z_score=z, normal_prob=normal_prob,
         chi2_stat=chi2_stat, chi2_pvalue=chi2_p, chi2_dof=dof, normal_fits=normal_fits,
+        last_price=last_price, high_pct_percentiles=high_pct_percentiles,
+        low_pct_percentiles=low_pct_percentiles, high_price_percentiles=high_price_percentiles,
+        low_price_percentiles=low_price_percentiles,
     )
 
 
@@ -405,10 +444,14 @@ class SimulationResult:
     p_sim: float
     wilson_lo: float
     wilson_hi: float
-    price_percentiles: dict     # {5: .., 25: .., 50: .., 75: .., 95: ..}
+    price_percentiles: dict     # {5: .., 25: .., 50: .., 75: .., 95: ..}  -- day-n_days ENDpoint price
     pct_move_percentiles: dict  # same keys, in % terms
     most_probable_price: float  # mode of the simulated final-price distribution
     most_probable_pct_move: float
+    period_high_price_percentiles: dict  # highest price reached at ANY point in the simulated period
+    period_low_price_percentiles: dict   # lowest price reached at ANY point in the simulated period
+    period_high_pct_percentiles: dict    # same, in % terms
+    period_low_pct_percentiles: dict
 
 
 def estimate_mode(values: np.ndarray) -> float:
@@ -478,6 +521,13 @@ def run_simulation(close: pd.Series, n_days: int, pct_move: float, direction: st
     final_prices = last_price * cum_growth[:, -1]
     pct_moves = path_pct_moves[:, -1]                      # endpoint % move (day n_days only)
 
+    # Always compute the per-path high/low (highest and lowest cumulative
+    # % move reached at any point within the simulated period) -- needed
+    # for touch-mode hit counting, and also reported directly as the
+    # "possible high/low" price range regardless of which mode is active.
+    max_path = path_pct_moves.max(axis=1)
+    min_path = path_pct_moves.min(axis=1)
+
     if mode == "endpoint":
         target = pct_moves
         if direction == "up":
@@ -487,8 +537,6 @@ def run_simulation(close: pd.Series, n_days: int, pct_move: float, direction: st
         else:
             hits = int((np.abs(target) >= pct_move).sum())
     else:  # touch
-        max_path = path_pct_moves.max(axis=1)
-        min_path = path_pct_moves.min(axis=1)
         if direction == "up":
             hits = int((max_path >= pct_move).sum())
         elif direction == "down":
@@ -499,10 +547,18 @@ def run_simulation(close: pd.Series, n_days: int, pct_move: float, direction: st
     p_sim = hits / n_sims
     lo, hi = wilson_interval(hits, n_sims)
 
-    price_pcts = {q: float(np.percentile(final_prices, q)) for q in (5, 25, 50, 75, 95)}
-    move_pcts = {q: float(np.percentile(pct_moves, q)) for q in (5, 25, 50, 75, 95)}
+    price_pcts = percentile_dict(final_prices)
+    move_pcts = percentile_dict(pct_moves)
     mode_price = estimate_mode(final_prices)
     mode_pct_move = (mode_price / last_price - 1) * 100.0
+
+    # "Possible high/low" over the whole period: percentiles of the running
+    # max/min price reached by each simulated path, not just where it ends
+    # up on day n_days.
+    period_high_pct_pcts = percentile_dict(max_path)
+    period_low_pct_pcts = percentile_dict(min_path)
+    period_high_price_pcts = {q: last_price * (1 + v / 100.0) for q, v in period_high_pct_pcts.items()}
+    period_low_price_pcts = {q: last_price * (1 + v / 100.0) for q, v in period_low_pct_pcts.items()}
 
     return SimulationResult(
         symbol="", method=method, mode=mode, n_sims=n_sims, n_days=n_days, pct_move=pct_move,
@@ -510,6 +566,10 @@ def run_simulation(close: pd.Series, n_days: int, pct_move: float, direction: st
         wilson_lo=lo, wilson_hi=hi, price_percentiles=price_pcts,
         pct_move_percentiles=move_pcts, most_probable_price=mode_price,
         most_probable_pct_move=mode_pct_move,
+        period_high_price_percentiles=period_high_price_pcts,
+        period_low_price_percentiles=period_low_price_pcts,
+        period_high_pct_percentiles=period_high_pct_pcts,
+        period_low_pct_percentiles=period_low_pct_pcts,
     )
 
 
@@ -520,7 +580,7 @@ def print_simulation_report(sim: SimulationResult):
     mode_note = "reached target on ANY simulated day (touch)" if sim.mode == "touch" \
         else "price on day N only (endpoint)"
 
-    print(f"\n[5] MONTE CARLO FORWARD SIMULATION — {sim.n_sims:,} simulated {sim.n_days}-day futures")
+    print(f"\n[6] MONTE CARLO FORWARD SIMULATION — {sim.n_sims:,} simulated {sim.n_days}-day futures")
     print(f"    Method                                     : {method_label}")
     print(f"    Hit counted as                             : {mode_note}")
     print(f"    Starting price (last close)                : {sim.last_price:.2f}")
@@ -530,12 +590,26 @@ def print_simulation_report(sim: SimulationResult):
           f"  ({sim.most_probable_pct_move:+.2f}%)")
     print(f"        (peak of the simulated outcome distribution — the single most")
     print(f"         likely price, not the average or midpoint)")
-    print(f"\n    Forecast price in {sim.n_days} trading days, by percentile:")
-    for q in (5, 25, 50, 75, 95):
+    print(f"\n    Forecast price ON DAY {sim.n_days} (endpoint), by percentile:")
+    for q in PERCENTILE_QS:
         pct_change = sim.pct_move_percentiles[q]
         marker = "  <- median" if q == 50 else ""
         print(f"        {q:>2}th percentile : {sim.price_percentiles[q]:>10.2f}  ({pct_change:+.2f}%){marker}")
-    print(f"    (5th/95th percentiles give a rough 90% forecast range.)")
+    print(f"    (5th/95th percentiles give a rough 90% forecast range for where the price")
+    print(f"     ends up exactly {sim.n_days} days from now.)")
+
+    print(f"\n    Possible HIGH / LOW at ANY point during the next {sim.n_days} days (not just day {sim.n_days}):")
+    print(f"        {'Percentile':>12}   {'Possible HIGH':>16}   {'Possible LOW':>16}")
+    for q in PERCENTILE_QS:
+        hi_p = sim.period_high_price_percentiles[q]
+        hi_pct = sim.period_high_pct_percentiles[q]
+        lo_p = sim.period_low_price_percentiles[q]
+        lo_pct = sim.period_low_pct_percentiles[q]
+        marker = "  <- median" if q == 50 else ""
+        print(f"        {q:>10}th   {hi_p:>10.2f} ({hi_pct:+.2f}%)   {lo_p:>10.2f} ({lo_pct:+.2f}%){marker}")
+    print(f"    e.g. the 95th-percentile HIGH is the level only the best 5% of simulated")
+    print(f"    futures reached; the 5th-percentile LOW is the level only the worst 5% of")
+    print(f"    simulated futures fell to (or below).")
 
 
 # --------------------------------------------------------------------------
@@ -567,13 +641,29 @@ def print_report(res: MoveAnalysisResult, company_name: str = ""):
     print(f"\n[2] 95% BINOMIAL (WILSON) CONFIDENCE INTERVAL")
     print(f"    True probability likely lies between      : {res.wilson_lo*100:.2f}% and {res.wilson_hi*100:.2f}%")
 
-    print(f"\n[3] NORMAL-DISTRIBUTION MODEL (for comparison, always based on endpoint returns)")
+    print(f"\n[3] POSSIBLE HIGH / LOW LEVELS (historical, applied to today's price of {res.last_price:.2f})")
+    print(f"    Across all {res.total_windows} overlapping {res.n_days}-day windows, historically, this is")
+    print(f"    how high/low the stock swung at ANY point within the window (not just at the")
+    print(f"    end) -- percentiles of those per-window extremes, scaled to today's price:")
+    print(f"        {'Percentile':>12}   {'Possible HIGH':>16}   {'Possible LOW':>16}")
+    for q in PERCENTILE_QS:
+        hi_p = res.high_price_percentiles[q]
+        hi_pct = res.high_pct_percentiles[q]
+        lo_p = res.low_price_percentiles[q]
+        lo_pct = res.low_pct_percentiles[q]
+        marker = "  <- median" if q == 50 else ""
+        print(f"        {q:>10}th   {hi_p:>10.2f} ({hi_pct:+.2f}%)   {lo_p:>10.2f} ({lo_pct:+.2f}%){marker}")
+    print(f"    e.g. the 95th-percentile HIGH is the level only the best 5% of historical")
+    print(f"    windows reached or exceeded; the 5th-percentile LOW is the level only the")
+    print(f"    worst 5% of historical windows fell to or below.")
+
+    print(f"\n[4] NORMAL-DISTRIBUTION MODEL (for comparison, always based on endpoint returns)")
     print(f"    Historical mean {res.n_days}-day return        : {res.hist_mean:.2f}%")
     print(f"    Historical std-dev {res.n_days}-day return     : {res.hist_std:.2f}%")
     print(f"    Z-score of the target move                : {res.z_score:.2f}")
     print(f"    Normal-model implied probability          : {res.normal_prob*100:.2f}%")
 
-    print(f"\n[4] CHI-SQUARE GOODNESS-OF-FIT TEST (is 'Normal' a fair model here? endpoint returns)")
+    print(f"\n[5] CHI-SQUARE GOODNESS-OF-FIT TEST (is 'Normal' a fair model here? endpoint returns)")
     print(f"    Chi-square statistic                      : {res.chi2_stat:.3f}  (dof={res.chi2_dof})")
     print(f"    p-value                                   : {res.chi2_pvalue:.4f}")
     if res.normal_fits:
