@@ -11,11 +11,10 @@ Usage:
         -> asks a short series of questions (same style as
            stock_move_analysis.py), then runs.
 
-    python screener.py --days 10 --top-n 20
-        -> runs immediately with defaults for everything else.
+    python screener.py --days 10 --symbols RELIANCE,TCS,INFY
+        -> runs immediately for specific manual symbols.
 
 Run `python screener.py --help` for the full flag list.
-
 """
 
 import sys
@@ -36,6 +35,13 @@ try:
     HAVE_TQDM = True
 except ImportError:
     HAVE_TQDM = False
+
+# Enable tab completion for interactive prompts on Unix/Linux/macOS
+try:
+    import readline
+    HAVE_READLINE = True
+except ImportError:
+    HAVE_READLINE = False
 
 # Reuse the exact same simulation engine + prompt helper as the single-stock
 # tool, so numbers and interaction style stay consistent between the two.
@@ -79,6 +85,29 @@ def load_ticker_list(path: str, symbol_col: str = "SYMBOL",
     return df
 
 
+def setup_ticker_completer(csv_path: str, symbol_col: str, series_col: str, series_filter: str):
+    """Sets up tab-completion for symbol input based on tickers.csv."""
+    if not HAVE_READLINE:
+        return
+    try:
+        series_f = None if series_filter.upper() in ("ALL", "") else series_filter
+        df = load_ticker_list(csv_path, symbol_col=symbol_col, series_col=series_col, series_filter=series_f)
+        symbols = df["SYMBOL"].tolist()
+    except Exception:
+        symbols = []
+
+    def completer(text, state):
+        matches = [s for s in symbols if s.startswith(text.upper())]
+        if state < len(matches):
+            return matches[state]
+        else:
+            return None
+
+    readline.set_completer(completer)
+    readline.set_completer_delims(' \t\n,')
+    readline.parse_and_bind("tab: complete")
+
+
 # --------------------------------------------------------------------------
 # Batched price downloads
 # --------------------------------------------------------------------------
@@ -99,7 +128,7 @@ def batch_download(symbols: list, period: str = "5y", batch_size: int = 10,
     for batch in iterator:
         try:
             data = yf.download(batch, period=period, group_by="ticker",
-                                threads=False, progress=False, auto_adjust=True)
+                                threads=True, progress=False, auto_adjust=True)
         except Exception as e:
             print(f"  Warning: batch download failed ({e}); skipping this batch.")
             continue
@@ -264,9 +293,14 @@ def interactive_prompt(defaults: argparse.Namespace) -> argparse.Namespace:
     if raw.isdigit():
         args.n_sims = int(raw)
 
-    raw = input("Only process the first N symbols, for a quick test (Enter to process all): ").strip()
-    if raw.isdigit():
-        args.limit = int(raw)
+    # Setup tab-completion for manual symbols input from CSV
+    setup_ticker_completer(args.excel_file, args.symbol_col, args.series_col, args.series_filter)
+    if HAVE_READLINE:
+        print("(Tab-completion enabled: press Tab to auto-complete stock symbols)")
+
+    raw = input("Enter specific symbols separated by commas manually (or Enter to use whole file): ").strip()
+    if raw:
+        args.symbols = raw
 
     raw = input(f"How many top results to show [{args.top_n}]: ").strip()
     if raw.isdigit():
@@ -288,6 +322,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--series-col", default="SERIES")
     parser.add_argument("--series-filter", default="EQ",
                          help="Keep only rows matching this SERIES value; 'ALL' or '' to disable filtering")
+    parser.add_argument("--symbols", default=None,
+                         help="Comma-separated list of specific symbols to process manually (e.g., RELIANCE,TCS,INFY)")
     parser.add_argument("--days", type=int, default=None, help="Number of trading days to forecast forward")
     parser.add_argument("--direction", choices=["up", "down", "either"], default="either")
     parser.add_argument("--mode", choices=["endpoint", "touch"], default="touch",
@@ -319,8 +355,16 @@ def run_screener(args: argparse.Namespace):
     print(f"Loading ticker list from {args.excel_file} ...")
     tickers_df = load_ticker_list(args.excel_file, args.symbol_col, name_col,
                                    args.series_col, series_filter)
+
+    # Filter manually by specified symbols if provided via CLI flag or prompt
+    if args.symbols:
+        target_symbols = [s.strip().upper() for s in args.symbols.split(",")]
+        tickers_df = tickers_df[tickers_df["SYMBOL"].isin(target_symbols)]
+        if tickers_df.empty:
+            print(f"Warning: None of the specified symbols ({args.symbols}) matched the loaded file/filter.")
+
     symbols = tickers_df["SYMBOL"].tolist()
-    if args.limit:
+    if args.limit and not args.symbols:
         symbols = symbols[:args.limit]
     name_map = dict(zip(tickers_df["SYMBOL"], tickers_df["NAME"])) if "NAME" in tickers_df.columns else None
 
