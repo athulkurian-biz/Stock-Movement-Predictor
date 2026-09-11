@@ -86,7 +86,7 @@ def load_ticker_list(path: str, symbol_col: str = "SYMBOL",
 
 
 def setup_ticker_completer(csv_path: str, symbol_col: str, series_col: str, series_filter: str):
-    """Sets up tab-completion for symbol input based on tickers.csv."""
+    """Sets up tab-completion for symbol input based on fnotickers.csv."""
     if not HAVE_READLINE:
         return
     try:
@@ -128,7 +128,7 @@ def batch_download(symbols: list, period: str = "5y", batch_size: int = 10,
     for batch in iterator:
         try:
             data = yf.download(batch, period=period, group_by="ticker",
-                                threads=True, progress=False, auto_adjust=True)
+                                threads=False, progress=False, auto_adjust=True)
         except Exception as e:
             print(f"  Warning: batch download failed ({e}); skipping this batch.")
             continue
@@ -315,8 +315,8 @@ def interactive_prompt(defaults: argparse.Namespace) -> argparse.Namespace:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Monte Carlo movement screener across a stock list")
-    parser.add_argument("--excel-file", default="tickers.csv",
-                         help="Path to ticker list (fixed default: tickers.csv)")
+    parser.add_argument("--excel-file", default="fnotickers.csv",
+                         help="Path to ticker list (fixed default: fnotickers.csv)")
     parser.add_argument("--symbol-col", default="SYMBOL")
     parser.add_argument("--name-col", default="NAME OF COMPANY")
     parser.add_argument("--series-col", default="SERIES")
